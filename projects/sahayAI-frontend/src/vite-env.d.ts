@@ -5,6 +5,10 @@ interface ImportMetaEnv {
 
   readonly VITE_WALLETCONNECT_PROJECT_ID?: string
 
+  readonly VITE_X402_PRICE_USDC?: string
+  readonly VITE_X402_SETTLEMENT_MICROALGO?: string
+  readonly VITE_X402_TREASURY?: string
+
   readonly VITE_SAHAY_APP_ID: string
   readonly VITE_SAHAY_ASSET_ID?: string
   readonly VITE_SAHAY_LOAN_AMOUNT_MICROALGO?: string
