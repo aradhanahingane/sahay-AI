@@ -1,0 +1,9 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: 2.1.8
+_src_path: gh:algorandfoundation/algokit-fullstack-template
+author_email: 105343290+AdityaNik@users.noreply.github.com
+author_name: ditya
+contract_name: hello_world
+preset_name: starter
+project_name: sahayAI
+
