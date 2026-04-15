@@ -28,22 +28,48 @@ export async function deploy() {
     })
   }
 
-  const method = 'create_loan'
-  await appClient.send.createLoan({
+  const lockedInrPerUsdPaise = 8450
+  await appClient.send.setFxRate({
     args: {
-      borrower: String(deployer.addr),
-      loanAmount: 20000,
-      repaymentAmount: 22000,
-      repaymentPercentage: 10,
+      lockedInrPerUsdPaise,
     },
   })
 
-  const response = await appClient.send.recordRepayment({
-    args: { amount: 1000 },
-  })
+  const usdcAssetId = process.env.USDC_ASSET_ID ? BigInt(process.env.USDC_ASSET_ID) : null
+  const borrowerAddr = process.env.BORROWER_ADDR
 
-  consoleLogger.info(
-    `Called ${method} and record_repayment on ${appClient.appClient.appName} (${appClient.appClient.appId}); repaid total: ${response.return}`,
-  )
+  if (usdcAssetId !== null && borrowerAddr) {
+    const loanFundingMicroUsdc = 500_000n
+    const loanInrAmount = 20_000n
+
+    await algorand
+      .newGroup()
+      .addAssetTransfer({
+        sender: deployer.addr,
+        receiver: borrowerAddr,
+        assetId: usdcAssetId,
+        amount: loanFundingMicroUsdc,
+      })
+      .addAppCallMethodCall(
+        await appClient.params.createLoan({
+          sender: deployer.addr,
+          args: {
+            borrower: borrowerAddr,
+            loanAmount: loanInrAmount,
+            repaymentAmount: 22_000,
+            repaymentPercentage: 10,
+          },
+        }),
+      )
+      .send()
+
+    consoleLogger.info(
+      `Ran grouped create_loan smoke flow with USDC asset ${usdcAssetId} and borrower ${borrowerAddr}`,
+    )
+  } else {
+    consoleLogger.info('Skipped grouped create_loan smoke flow (set USDC_ASSET_ID and BORROWER_ADDR to enable it).')
+  }
+
+  consoleLogger.info(`Locked FX rate (paise per USD): ${lockedInrPerUsdPaise}`)
   consoleLogger.info(`Use in frontend env: VITE_SAHAY_APP_ID=${appClient.appId}`)
 }

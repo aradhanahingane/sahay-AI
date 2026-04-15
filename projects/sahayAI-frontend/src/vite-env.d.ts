@@ -14,6 +14,7 @@ interface ImportMetaEnv {
   readonly VITE_SAHAY_LOAN_AMOUNT_MICROALGO?: string
   readonly VITE_SAHAY_REPAYMENT_AMOUNT_MICROALGO?: string
   readonly VITE_SAHAY_REPAYMENT_PERCENTAGE?: string
+  readonly VITE_SAHAY_LOCKED_INR_PER_USD_PAISE?: string
 
   readonly VITE_ALGOD_TOKEN: string
   readonly VITE_ALGOD_SERVER: string

@@ -66,15 +66,20 @@ const ASSET_ID = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_ASSET_ID, '10
 const LOAN_AMOUNT = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_LOAN_AMOUNT_MICROALGO, '500000')
 const REPAYMENT_AMOUNT = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_REPAYMENT_AMOUNT_MICROALGO, '550000')
 const REPAYMENT_PERCENTAGE = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_REPAYMENT_PERCENTAGE, '10')
+const REPAYMENT_STEP_INR = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_REPAYMENT_STEP_INR, '1000')
+const LOCKED_INR_PER_USD_PAISE = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_LOCKED_INR_PER_USD_PAISE, '8450')
 const X402_SETTLEMENT_MICROALGO = parseBigIntWithDefault(import.meta.env.VITE_X402_SETTLEMENT_MICROALGO, '10000')
 const X402_PRICE_USDC = import.meta.env.VITE_X402_PRICE_USDC ?? '0.5'
 const X402_TREASURY = import.meta.env.VITE_X402_TREASURY
+const ALGORAND_MIN_ACCOUNT_BALANCE = 100000
+const LOAN_AMOUNT_INR = 20000
+const REPAYMENT_AMOUNT_INR = 22000
 
 const networkExplorerBase = (network: string) => `https://lora.algokit.io/${network.toLowerCase()}`
 const initialProgress = (): TxProgress[] => [
-  { label: 'Payment initiated', confirmed: false },
+  { label: 'USDC funding sent', confirmed: false },
   { label: 'Loan record updated', confirmed: false },
-  { label: 'Consent link finalized', confirmed: false },
+  { label: 'Group finalized', confirmed: false },
 ]
 
 const fetchCashflowFromBackend = async (borrowerAddress: string, paid: boolean): Promise<CashflowData> => {
@@ -84,8 +89,8 @@ const fetchCashflowFromBackend = async (borrowerAddress: string, paid: boolean):
     throw error
   }
 
-  const tail = Number.parseInt(borrowerAddress.slice(-2), 16)
-  const avgDailyRevenueInr = 3200 + (tail % 7) * 370
+  const addressScore = Array.from(borrowerAddress).reduce((total, character) => total + character.charCodeAt(0), 0)
+  const avgDailyRevenueInr = 3200 + (addressScore % 7) * 370
   const monthlyInflowInr = avgDailyRevenueInr * 30
   const cashflowHealth: CashflowData['cashflowHealth'] = avgDailyRevenueInr > 4300 ? 'High' : avgDailyRevenueInr > 3600 ? 'Medium' : 'Low'
   return { avgDailyRevenueInr, monthlyInflowInr, cashflowHealth }
@@ -95,6 +100,13 @@ const sha256Hex = async (value: string) => {
   const bytes = new TextEncoder().encode(value)
   const digest = await crypto.subtle.digest('SHA-256', bytes)
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+const isZeroAddressBytes = (value: Uint8Array) => value.every((b) => b === 0)
+const toErrorMessage = (error: unknown) => {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'string') return error
+  return 'Unknown error'
 }
 
 export default function Home() {
@@ -122,11 +134,14 @@ export default function Home() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [progress, setProgress] = useState<TxProgress[]>(initialProgress)
   const [result, setResult] = useState<SettlementResult | null>(null)
+  const [isRepaying, setIsRepaying] = useState(false)
+  const [repaymentTxId, setRepaymentTxId] = useState<string | null>(null)
 
   const activeWallet = wallets?.find((w) => w.isActive)
-  const canAnalyze = (channels.upi || channels.bank || channels.pos) && cashflowData !== null
-  const loanAmountAlgo = (Number(LOAN_AMOUNT) / 1_000_000).toFixed(2)
-  const repaymentAmountAlgo = (Number(REPAYMENT_AMOUNT) / 1_000_000).toFixed(2)
+  const hasSelectedChannel = channels.upi || channels.bank || channels.pos
+  const canAnalyze = hasSelectedChannel && cashflowData !== null
+  const loanAmountLabel = `₹${LOAN_AMOUNT_INR.toLocaleString('en-IN')}`
+  const repaymentAmountLabel = `₹${REPAYMENT_AMOUNT_INR.toLocaleString('en-IN')}`
 
   const connectWallet = async (wallet: Wallet) => {
     try {
@@ -135,12 +150,6 @@ export default function Home() {
     } catch {
       enqueueSnackbar('Wallet connection failed', { variant: 'error' })
     }
-  }
-
-  const getAssetHolding = async (address: string, assetId: bigint) => {
-    const account = await algorand.client.algod.accountInformation(address).do()
-    const holdings = account.assets ?? []
-    return holdings.find((item) => BigInt(item.assetId) === assetId)
   }
 
   const pollForConfirmation = (txIds: string[]) => {
@@ -205,6 +214,72 @@ export default function Home() {
         defaultSender: activeAddress,
       })
 
+      const [lenderAuthState, usdcAssetIdState] = await Promise.all([
+        client.state.global.lenderAuth(),
+        client.state.global.usdcAssetId(),
+      ])
+      const lenderAuthBytes = lenderAuthState.asByteArray()
+      if (lenderAuthBytes && lenderAuthBytes.length === 32 && !isZeroAddressBytes(lenderAuthBytes)) {
+        const lenderAddress = algosdk.encodeAddress(lenderAuthBytes)
+        if (lenderAddress !== activeAddress) {
+          enqueueSnackbar('This app can only originate loans from the configured lender wallet', { variant: 'error' })
+          return
+        }
+      }
+      const fundingAssetId = usdcAssetIdState && usdcAssetIdState > 0n ? usdcAssetIdState : ASSET_ID
+
+      const lockedFxRate = await client.state.global.lockedInrPerUsdPaise()
+      if (!lockedFxRate || lockedFxRate === 0n) {
+        if (LOCKED_INR_PER_USD_PAISE <= 0n) {
+          enqueueSnackbar('Missing VITE_SAHAY_LOCKED_INR_PER_USD_PAISE value', { variant: 'error' })
+          return
+        }
+
+        await client.send.setFxRate({
+          sender: activeAddress,
+          signer: transactionSigner,
+          args: {
+            lockedInrPerUsdPaise: LOCKED_INR_PER_USD_PAISE,
+          },
+        })
+        enqueueSnackbar(`Initialized contract FX rate to ${LOCKED_INR_PER_USD_PAISE.toString()} paise per USD`, {
+          variant: 'info',
+        })
+      }
+
+      const [borrowerAuthState, totalUsdcOwedMicroState, totalUsdcRepaidMicroState, loanClosedState] = await Promise.all([
+        client.state.global.borrowerAuth(),
+        client.state.global.totalUsdcOwedMicro(),
+        client.state.global.totalUsdcRepaidMicro(),
+        client.state.global.loanClosed(),
+      ])
+      const activeLoanOpen = (loanClosedState ?? 0n) === 0n && (totalUsdcOwedMicroState ?? 0n) > (totalUsdcRepaidMicroState ?? 0n)
+      if (activeLoanOpen) {
+        const borrowerBytes = borrowerAuthState.asByteArray()
+        const borrowerAddress = borrowerBytes && borrowerBytes.length === 32 && !isZeroAddressBytes(borrowerBytes)
+          ? algosdk.encodeAddress(borrowerBytes)
+          : null
+        if (!borrowerAddress || borrowerAddress === activeAddress) {
+          setMerchantStep('active-loan')
+          enqueueSnackbar('An active loan already exists. Open the live loan view instead of creating a new one.', {
+            variant: 'info',
+          })
+          return
+        }
+        enqueueSnackbar('This app already has an active loan on-chain', { variant: 'error' })
+        return
+      }
+
+      const senderAccount = await algorand.client.algod.accountInformation(activeAddress).do()
+      const senderAssetHolding = senderAccount.assets?.find((asset) => asset.assetId === fundingAssetId)
+      if (!senderAssetHolding || Number(senderAssetHolding.amount ?? 0) < Number(LOAN_AMOUNT)) {
+        enqueueSnackbar(
+          `Connected wallet does not hold enough of asset ${fundingAssetId.toString()} to fund the loan`,
+          { variant: 'error' },
+        )
+        return
+      }
+
       const appCall = await client.params.createLoan({
         sender: activeAddress,
         signer: transactionSigner,
@@ -216,32 +291,16 @@ export default function Home() {
         },
       })
 
-      const assetHolding = await getAssetHolding(activeAddress, ASSET_ID)
       const composer = algorand
         .newGroup()
-        .addPayment({
+        .addAssetTransfer({
           sender: activeAddress,
           signer: transactionSigner,
-          receiver: client.appAddress,
-          amount: algo(Number(LOAN_AMOUNT) / 1_000_000),
+          assetId: fundingAssetId,
+          receiver: activeAddress,
+          amount: LOAN_AMOUNT,
         })
         .addAppCallMethodCall(appCall)
-
-      if (assetHolding) {
-        composer.addAssetTransfer({
-          sender: activeAddress,
-          signer: transactionSigner,
-          assetId: ASSET_ID,
-          receiver: activeAddress,
-          amount: 0n,
-        })
-      } else {
-        composer.addAssetOptIn({
-          sender: activeAddress,
-          signer: transactionSigner,
-          assetId: ASSET_ID,
-        })
-      }
 
       const sendResult = await composer.send({ maxRoundsToWaitForConfirmation: 4 })
       const txIds = sendResult.txIds
@@ -256,7 +315,7 @@ export default function Home() {
         groupId: sendResult.groupId,
         appId: APP_ID,
         appAddress: String(client.appAddress),
-        assetId: ASSET_ID,
+        assetId: fundingAssetId,
         network: algodConfig.network,
         borrower: activeAddress,
         loanAmount: LOAN_AMOUNT,
@@ -268,8 +327,8 @@ export default function Home() {
 
       enqueueSnackbar('Transfer submitted. Finalizing...', { variant: 'info' })
       pollForConfirmation(txIds)
-    } catch {
-      enqueueSnackbar('Transfer failed. Please try again.', { variant: 'error' })
+    } catch (error) {
+      enqueueSnackbar(`Transfer failed: ${toErrorMessage(error)}`, { variant: 'error' })
       setMerchantStep('approved')
     } finally {
       setIsSubmitting(false)
@@ -285,8 +344,121 @@ export default function Home() {
     setShowAccessDetails(false)
     setConsentHash(null)
     setConsentTxId(null)
+    setRepaymentTxId(null)
     setResult(null)
     setProgress(initialProgress())
+  }
+
+  const submitRepayment = async () => {
+    if (APP_ID === null) {
+      enqueueSnackbar('Missing or invalid VITE_SAHAY_APP_ID in frontend environment', { variant: 'error' })
+      return
+    }
+
+    if (!activeAddress || !transactionSigner) {
+      enqueueSnackbar('Connect wallet before repayment', { variant: 'warning' })
+      return
+    }
+
+    setIsRepaying(true)
+    try {
+      const client = new SahayAiLendingClient({
+        algorand,
+        appId: APP_ID,
+        defaultSender: activeAddress,
+      })
+
+      const [lockedFxRate, lenderAuthState, borrowerAuthState, usdcAssetIdState, loanClosedState, totalUsdcOwedMicroState, totalUsdcRepaidMicroState, repaymentPercentageState] = await Promise.all([
+        client.state.global.lockedInrPerUsdPaise(),
+        client.state.global.lenderAuth(),
+        client.state.global.borrowerAuth(),
+        client.state.global.usdcAssetId(),
+        client.state.global.loanClosed(),
+        client.state.global.totalUsdcOwedMicro(),
+        client.state.global.totalUsdcRepaidMicro(),
+        client.state.global.repaymentPercentage(),
+      ])
+
+      if (!lockedFxRate || lockedFxRate === 0n) {
+        enqueueSnackbar('Contract FX rate is not configured yet', { variant: 'error' })
+        return
+      }
+      if (loanClosedState === 1n) {
+        enqueueSnackbar('Loan is already closed', { variant: 'info' })
+        return
+      }
+
+      const lenderBytes = lenderAuthState.asByteArray()
+      if (!lenderBytes || lenderBytes.length !== 32 || isZeroAddressBytes(lenderBytes)) {
+        enqueueSnackbar('Lender account not set on contract', { variant: 'error' })
+        return
+      }
+      const lenderAddress = algosdk.encodeAddress(lenderBytes)
+
+      const borrowerBytes = borrowerAuthState.asByteArray()
+      if (!borrowerBytes || borrowerBytes.length !== 32 || isZeroAddressBytes(borrowerBytes)) {
+        enqueueSnackbar('Borrower account not set on contract', { variant: 'error' })
+        return
+      }
+      const borrowerAddress = algosdk.encodeAddress(borrowerBytes)
+      if (borrowerAddress !== activeAddress) {
+        enqueueSnackbar('Connect the borrower wallet to record repayments', { variant: 'error' })
+        return
+      }
+
+      const repaymentAssetId = usdcAssetIdState && usdcAssetIdState > 0n ? usdcAssetIdState : ASSET_ID
+      const repaymentPercentage = repaymentPercentageState && repaymentPercentageState > 0n ? repaymentPercentageState : REPAYMENT_PERCENTAGE
+      const remainingOwedMicroUsdc = (totalUsdcOwedMicroState ?? 0n) > (totalUsdcRepaidMicroState ?? 0n)
+        ? (totalUsdcOwedMicroState ?? 0n) - (totalUsdcRepaidMicroState ?? 0n)
+        : 0n
+      const maxSafeRepaymentInr = remainingOwedMicroUsdc > 0n && repaymentPercentage > 0n
+        ? (remainingOwedMicroUsdc * lockedFxRate) / (repaymentPercentage * 1_000_000n)
+        : 0n
+      const repaymentStepInr = REPAYMENT_STEP_INR <= maxSafeRepaymentInr ? REPAYMENT_STEP_INR : maxSafeRepaymentInr
+      if (repaymentStepInr <= 0n) {
+        enqueueSnackbar('No remaining repayment capacity is available for this loan', { variant: 'error' })
+        return
+      }
+      if (repaymentStepInr !== REPAYMENT_STEP_INR) {
+        enqueueSnackbar(
+          `Repayment step adjusted to ₹${repaymentStepInr.toString()} to fit the remaining on-chain balance`,
+          { variant: 'info' },
+        )
+      }
+
+      const repaymentMicroUsdc = (repaymentStepInr * repaymentPercentage * 1_000_000n) / lockedFxRate
+      if (repaymentMicroUsdc <= 0n) {
+        enqueueSnackbar('Repayment amount resolves to zero; adjust settings', { variant: 'error' })
+        return
+      }
+
+      const appCall = await client.params.recordRepayment({
+        sender: activeAddress,
+        signer: transactionSigner,
+        args: {
+          amount: repaymentStepInr,
+        },
+      })
+
+      const sendResult = await algorand
+        .newGroup()
+        .addAssetTransfer({
+          sender: activeAddress,
+          signer: transactionSigner,
+          assetId: repaymentAssetId,
+          receiver: lenderAddress,
+          amount: repaymentMicroUsdc,
+        })
+        .addAppCallMethodCall(appCall)
+        .send({ maxRoundsToWaitForConfirmation: 4 })
+
+      setRepaymentTxId(sendResult.txIds[0] ?? null)
+      enqueueSnackbar('Repayment submitted and recorded on-chain', { variant: 'success' })
+    } catch (error) {
+      enqueueSnackbar(`Repayment failed: ${toErrorMessage(error)}`, { variant: 'error' })
+    } finally {
+      setIsRepaying(false)
+    }
   }
 
   const isKmd = (wallet: Wallet) => wallet.id === WalletId.KMD
@@ -338,11 +510,47 @@ export default function Home() {
       const consentPayload = `${activeAddress}|cashflow-read|${Date.now()}`
       const hash = await sha256Hex(consentPayload)
       const receiver = X402_TREASURY || String(client.appAddress)
+      if (!algosdk.isValidAddress(receiver)) {
+        enqueueSnackbar('Invalid x402 treasury address configured', { variant: 'error' })
+        return
+      }
+
+      const amountMicroAlgo = Number(X402_SETTLEMENT_MICROALGO)
+      if (!Number.isSafeInteger(amountMicroAlgo) || amountMicroAlgo <= 0) {
+        enqueueSnackbar('Invalid VITE_X402_SETTLEMENT_MICROALGO value', { variant: 'error' })
+        return
+      }
+
+      let receiverBalance = 0
+      let receiverMinBalance = ALGORAND_MIN_ACCOUNT_BALANCE
+      try {
+        const receiverAccount = await algorand.client.algod.accountInformation(receiver).do()
+        receiverBalance = Number(receiverAccount.amount ?? 0)
+        receiverMinBalance = Number(receiverAccount.minBalance ?? ALGORAND_MIN_ACCOUNT_BALANCE)
+      } catch {
+        // If account doesn't exist yet, funding at least min balance is required to create it.
+      }
+
+      const receiverDeficit = Math.max(0, receiverMinBalance - receiverBalance)
+      const amountToSend = Math.max(amountMicroAlgo, receiverDeficit)
+
+      const senderAccount = await algorand.client.algod.accountInformation(activeAddress).do()
+      const senderBalance = Number(senderAccount.amount ?? 0)
+      const minRequired = amountToSend + 2_000
+      if (senderBalance < minRequired) {
+        enqueueSnackbar('Insufficient ALGO balance for consent payment + fee', { variant: 'error' })
+        return
+      }
+
+      if (amountToSend > amountMicroAlgo) {
+        enqueueSnackbar('Treasury account is being initialized to Algorand minimum balance (0.1 ALGO)', { variant: 'info' })
+      }
+
       const payResult = await algorand.send.payment({
         sender: activeAddress,
         signer: transactionSigner,
         receiver,
-        amount: algo(Number(X402_SETTLEMENT_MICROALGO) / 1_000_000),
+        amount: algo(amountToSend / 1_000_000),
         note: `x402-consent:${hash}`,
       })
 
@@ -354,8 +562,8 @@ export default function Home() {
       const data = await fetchCashflowFromBackend(activeAddress, true)
       setCashflowData(data)
       enqueueSnackbar('Payment confirmed. Cashflow access granted.', { variant: 'success' })
-    } catch {
-      enqueueSnackbar('Payment failed. Access still locked.', { variant: 'error' })
+    } catch (error) {
+      enqueueSnackbar(`Payment failed: ${toErrorMessage(error)}`, { variant: 'error' })
     } finally {
       setIsPayingForCashflow(false)
     }
@@ -431,7 +639,8 @@ export default function Home() {
         <section className="merchant-wrap">
           <aside className="merchant-side">
             <p className="chip">Merchant App</p>
-            <p className="micro-copy">Loan offer: Rs20,000</p>
+            <p className="micro-copy">Loan offer: {loanAmountLabel}</p>
+            <p className="micro-copy">Expected repayment: {repaymentAmountLabel}</p>
             <p className="micro-copy">Auto-repayment: {REPAYMENT_PERCENTAGE.toString()}% of verified inflow</p>
             {renderWalletSelector()}
           </aside>
@@ -481,7 +690,11 @@ export default function Home() {
                   <span className="radio">{channels.pos ? 'ON' : ''}</span>
                 </button>
 
-                <button className="phone-cta muted" disabled={!canAnalyze} onClick={() => setMerchantStep('approved')}>
+                <button
+                  className={`phone-cta ${hasSelectedChannel ? 'analysis-ready' : 'muted'}`}
+                  disabled={!canAnalyze}
+                  onClick={() => setMerchantStep('approved')}
+                >
                   Analyze Cash Flow
                 </button>
 
@@ -510,7 +723,7 @@ export default function Home() {
               <div className="phone-body success-tone">
                 <div className="badge-icon success">OK</div>
                 <p className="status-pill">Credit Generated</p>
-                <h3 className="amount">Rs20,000</h3>
+                <h3 className="amount">₹20,000</h3>
                 <h4>Approved</h4>
 
                 <div className="info-card">
@@ -551,7 +764,7 @@ export default function Home() {
 
                 <div className="loan-card">
                   <p>Remaining Balance</p>
-                  <h3>Rs19,480</h3>
+                  <h3>₹19,480</h3>
                   <div className="progress-bar">
                     <div className="progress-fill" />
                   </div>
@@ -560,17 +773,21 @@ export default function Home() {
                 <div className="tx-list">
                   <div>
                     <span>Deduction</span>
-                    <strong>-Rs20 live</strong>
+                    <strong>-₹20 live</strong>
                   </div>
                   <div>
                     <span>Deduction</span>
-                    <strong>-Rs45 today</strong>
+                    <strong>-₹45 today</strong>
                   </div>
                   <div>
                     <span>Deduction</span>
-                    <strong>-Rs120 yesterday</strong>
+                    <strong>-₹120 yesterday</strong>
                   </div>
                 </div>
+
+                <button className="phone-cta" disabled={isRepaying || !activeAddress || APP_ID === null} onClick={submitRepayment}>
+                  {isRepaying ? 'Processing Repayment...' : `Run Repayment Step (₹${REPAYMENT_STEP_INR.toString()})`}
+                </button>
 
                 {result && (
                   <div className="proof-links">
@@ -584,6 +801,11 @@ export default function Home() {
                           </a>
                         ))}
                       </>
+                    )}
+                    {repaymentTxId && (
+                      <a target="_blank" rel="noreferrer" href={`${networkExplorerBase(algodConfig.network)}/transaction/${repaymentTxId}`}>
+                        View latest repayment txn
+                      </a>
                     )}
                   </div>
                 )}
@@ -611,7 +833,7 @@ export default function Home() {
             </article>
             <article>
               <p>Liquidity Deployed</p>
-              <strong>Rs52.4L</strong>
+              <strong>₹52.4L</strong>
             </article>
             <article>
               <p>Repayment Efficiency</p>
