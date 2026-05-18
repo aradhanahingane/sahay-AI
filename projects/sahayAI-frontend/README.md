@@ -20,6 +20,15 @@ Run the following commands within the project folder:
 
 - **Install Project Dependencies**: With `algokit project bootstrap all`, ensure all dependencies are ready.
 
+### Backend API
+
+The merchant and lender flows expect the Node backend in `projects/sahayAI-server` to be running. Ensure the frontend `.env` contains:
+
+- `VITE_API_BASE_URL=http://localhost:4000`
+- `VITE_X402_SETTLEMENT_MICROALGO` and `VITE_X402_PLATFORM_FEE_MICROALGO`
+
+See the server README for setup steps.
+
 ### Development Workflow
 
 #### Terminal

@@ -1,34 +1,14 @@
 import { algo, AlgorandClient } from '@algorandfoundation/algokit-utils'
 import algosdk from 'algosdk'
 import { useSnackbar } from 'notistack'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useWallet, Wallet, WalletId } from '@txnlab/use-wallet-react'
 import { SahayAiLendingClient } from './contracts/SahayAiLending'
-import { getAlgodConfigFromViteEnvironment, getIndexerConfigFromViteEnvironment } from './utils/network/getAlgoClientConfigs'
+import { ellipseAddress } from './utils/ellipseAddress'
+import { getAlgodConfigFromViteEnvironment } from './utils/network/getAlgoClientConfigs'
 
 type Surface = 'hub' | 'merchant' | 'lender'
-type MerchantStep = 'connect' | 'approved' | 'settling' | 'active-loan'
-
-type TxProgress = {
-  label: string
-  txId?: string
-  confirmedRound?: number
-  confirmed: boolean
-}
-
-type SettlementResult = {
-  groupId: string
-  appId: bigint
-  appAddress: string
-  assetId: bigint
-  network: string
-  borrower: string
-  loanAmount: bigint
-  repaymentAmount: bigint
-  repaymentPercentage: bigint
-  txIds: string[]
-  confirmedRound: number
-}
+type MerchantStep = 'connect' | 'offer' | 'requested' | 'active-loan'
 
 type RevenueChannel = {
   upi: boolean
@@ -36,10 +16,51 @@ type RevenueChannel = {
   pos: boolean
 }
 
-type CashflowData = {
+type CashflowEntry = {
+  id: string
+  date: string
+  channel: 'UPI' | 'BANK' | 'POS'
+  amountInr: number
+  ref: string
+}
+
+type CashflowSummary = {
   avgDailyRevenueInr: number
   monthlyInflowInr: number
+  volatility: number
   cashflowHealth: 'Low' | 'Medium' | 'High'
+  channels: Array<'UPI' | 'BANK' | 'POS'>
+}
+
+type LoanOffer = {
+  id: string
+  loanAmountInr: number
+  repaymentAmountInr: number
+  interestRateApr: number
+  tenureMonths: number
+  repaymentPercentage: number
+  platformFeeInr: number
+  score: number
+  riskTier: 'A' | 'B' | 'C'
+}
+
+type CashflowPayload = {
+  cashflowId: string
+  offer: LoanOffer
+  summary: CashflowSummary
+  entries: CashflowEntry[]
+}
+
+type LoanRequest = {
+  id: string
+  status: 'pending' | 'approved' | 'funded'
+  merchantAddress: string
+  offer: LoanOffer
+  summary: CashflowSummary
+  createdAt: string
+  lenderAddress?: string | null
+  settlementGroupId?: string | null
+  settlementTxIds?: string[]
 }
 
 const parseRequiredBigInt = (value: string | undefined) => {
@@ -63,37 +84,63 @@ const parseBigIntWithDefault = (value: string | undefined, fallback: string) => 
 
 const APP_ID = parseRequiredBigInt(import.meta.env.VITE_SAHAY_APP_ID)
 const ASSET_ID = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_ASSET_ID, '10458941')
-const LOAN_AMOUNT = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_LOAN_AMOUNT_MICROALGO, '500000')
-const REPAYMENT_AMOUNT = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_REPAYMENT_AMOUNT_MICROALGO, '550000')
-const REPAYMENT_PERCENTAGE = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_REPAYMENT_PERCENTAGE, '10')
 const REPAYMENT_STEP_INR = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_REPAYMENT_STEP_INR, '1000')
 const LOCKED_INR_PER_USD_PAISE = parseBigIntWithDefault(import.meta.env.VITE_SAHAY_LOCKED_INR_PER_USD_PAISE, '8450')
 const X402_SETTLEMENT_MICROALGO = parseBigIntWithDefault(import.meta.env.VITE_X402_SETTLEMENT_MICROALGO, '10000')
+const X402_PLATFORM_FEE_MICROALGO = parseBigIntWithDefault(import.meta.env.VITE_X402_PLATFORM_FEE_MICROALGO, '20000')
 const X402_PRICE_USDC = import.meta.env.VITE_X402_PRICE_USDC ?? '0.5'
 const X402_TREASURY = import.meta.env.VITE_X402_TREASURY
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000'
 const ALGORAND_MIN_ACCOUNT_BALANCE = 100000
-const LOAN_AMOUNT_INR = 20000
-const REPAYMENT_AMOUNT_INR = 22000
+const FALLBACK_LOAN_INR = 20000
+const FALLBACK_REPAYMENT_INR = 22000
 
 const networkExplorerBase = (network: string) => `https://lora.algokit.io/${network.toLowerCase()}`
-const initialProgress = (): TxProgress[] => [
-  { label: 'USDC funding sent', confirmed: false },
-  { label: 'Loan record updated', confirmed: false },
-  { label: 'Group finalized', confirmed: false },
-]
+const channelLabels: Record<keyof RevenueChannel, 'UPI' | 'BANK' | 'POS'> = { upi: 'UPI', bank: 'BANK', pos: 'POS' }
 
-const fetchCashflowFromBackend = async (borrowerAddress: string, paid: boolean): Promise<CashflowData> => {
-  if (!paid) {
+const fetchCashflowFromBackend = async (borrowerAddress: string, channels: RevenueChannel, proof?: string): Promise<CashflowPayload> => {
+  const selectedChannels = Object.entries(channels)
+    .filter(([, enabled]) => enabled)
+    .map(([key]) => channelLabels[key as keyof RevenueChannel])
+    .join(',')
+
+  const params = new URLSearchParams({
+    merchantAddress: borrowerAddress,
+    channels: selectedChannels,
+    count: '70',
+  })
+
+  const response = await fetch(`${API_BASE_URL}/api/cashflow?${params.toString()}`, {
+    headers: proof ? { 'x402-proof': proof } : {},
+  })
+
+  if (response.status === 402) {
     const error = new Error('Payment required') as Error & { status?: number }
     error.status = 402
     throw error
   }
 
-  const addressScore = Array.from(borrowerAddress).reduce((total, character) => total + character.charCodeAt(0), 0)
-  const avgDailyRevenueInr = 3200 + (addressScore % 7) * 370
-  const monthlyInflowInr = avgDailyRevenueInr * 30
-  const cashflowHealth: CashflowData['cashflowHealth'] = avgDailyRevenueInr > 4300 ? 'High' : avgDailyRevenueInr > 3600 ? 'Medium' : 'Low'
-  return { avgDailyRevenueInr, monthlyInflowInr, cashflowHealth }
+  if (!response.ok) {
+    throw new Error('Failed to fetch cashflow data')
+  }
+
+  return response.json() as Promise<CashflowPayload>
+}
+
+const fetchLoanRequests = async (): Promise<LoanRequest[]> => {
+  const response = await fetch(`${API_BASE_URL}/api/loans`)
+  if (!response.ok) {
+    throw new Error('Failed to load loan requests')
+  }
+  return response.json() as Promise<LoanRequest[]>
+}
+
+const fetchLoanRequestById = async (loanId: string): Promise<LoanRequest> => {
+  const response = await fetch(`${API_BASE_URL}/api/loans/${loanId}`)
+  if (!response.ok) {
+    throw new Error('Failed to load loan status')
+  }
+  return response.json() as Promise<LoanRequest>
 }
 
 const sha256Hex = async (value: string) => {
@@ -111,12 +158,7 @@ const toErrorMessage = (error: unknown) => {
 
 export default function Home() {
   const algodConfig = getAlgodConfigFromViteEnvironment()
-  const indexerConfig = getIndexerConfigFromViteEnvironment()
   const algorand = useMemo(() => AlgorandClient.fromConfig({ algodConfig }), [algodConfig])
-  const indexer = useMemo(
-    () => new algosdk.Indexer(String(indexerConfig.token), indexerConfig.server, indexerConfig.port),
-    [indexerConfig],
-  )
 
   const { wallets, activeAddress, transactionSigner } = useWallet()
   const { enqueueSnackbar } = useSnackbar()
@@ -124,24 +166,31 @@ export default function Home() {
   const [surface, setSurface] = useState<Surface>('hub')
   const [merchantStep, setMerchantStep] = useState<MerchantStep>('connect')
   const [channels, setChannels] = useState<RevenueChannel>({ upi: false, bank: false, pos: false })
-  const [cashflowData, setCashflowData] = useState<CashflowData | null>(null)
+  const [cashflowSummary, setCashflowSummary] = useState<CashflowSummary | null>(null)
+  const [cashflowEntries, setCashflowEntries] = useState<CashflowEntry[]>([])
+  const [cashflowId, setCashflowId] = useState<string | null>(null)
+  const [loanOffer, setLoanOffer] = useState<LoanOffer | null>(null)
+  const [loanRequest, setLoanRequest] = useState<LoanRequest | null>(null)
+  const [loanRequests, setLoanRequests] = useState<LoanRequest[]>([])
   const [hasPaidForCashflow, setHasPaidForCashflow] = useState(false)
   const [isPayingForCashflow, setIsPayingForCashflow] = useState(false)
+  const [isSubmittingRequest, setIsSubmittingRequest] = useState(false)
+  const [isFundingLoan, setIsFundingLoan] = useState(false)
+  const [fundingLoanId, setFundingLoanId] = useState<string | null>(null)
+  const [isLoadingLoans, setIsLoadingLoans] = useState(false)
   const [showPaywall, setShowPaywall] = useState(false)
   const [showAccessDetails, setShowAccessDetails] = useState(false)
   const [consentHash, setConsentHash] = useState<string | null>(null)
   const [consentTxId, setConsentTxId] = useState<string | null>(null)
-  const [isSubmitting, setIsSubmitting] = useState(false)
-  const [progress, setProgress] = useState<TxProgress[]>(initialProgress)
-  const [result, setResult] = useState<SettlementResult | null>(null)
+  const [platformFeeTxId, setPlatformFeeTxId] = useState<string | null>(null)
   const [isRepaying, setIsRepaying] = useState(false)
   const [repaymentTxId, setRepaymentTxId] = useState<string | null>(null)
 
   const activeWallet = wallets?.find((w) => w.isActive)
   const hasSelectedChannel = channels.upi || channels.bank || channels.pos
-  const canAnalyze = hasSelectedChannel && cashflowData !== null
-  const loanAmountLabel = `₹${LOAN_AMOUNT_INR.toLocaleString('en-IN')}`
-  const repaymentAmountLabel = `₹${REPAYMENT_AMOUNT_INR.toLocaleString('en-IN')}`
+  const loanAmountLabel = `₹${(loanOffer?.loanAmountInr ?? FALLBACK_LOAN_INR).toLocaleString('en-IN')}`
+  const repaymentAmountLabel = `₹${(loanOffer?.repaymentAmountInr ?? FALLBACK_REPAYMENT_INR).toLocaleString('en-IN')}`
+  const repaymentPercentageLabel = loanOffer?.repaymentPercentage ?? 10
 
   const connectWallet = async (wallet: Wallet) => {
     try {
@@ -152,60 +201,201 @@ export default function Home() {
     }
   }
 
-  const pollForConfirmation = (txIds: string[]) => {
-    const timer = window.setInterval(async () => {
-      try {
-        const checks = await Promise.all(
-          txIds.map(async (txId) => {
-            const tx = await indexer.lookupTransactionByID(txId).do()
-            const round = Number(tx.transaction.confirmedRound ?? 0)
-            return { txId, confirmedRound: round, confirmed: round > 0 }
-          }),
-        )
+  const sendX402Payment = async (notePrefix: string, amountMicroAlgo: bigint) => {
+    if (!activeAddress || !transactionSigner) {
+      enqueueSnackbar('Connect wallet before payment', { variant: 'warning' })
+      return null
+    }
 
-        setProgress((current) =>
-          current.map((item, i) => ({
-            ...item,
-            txId: checks[i]?.txId,
-            confirmedRound: checks[i]?.confirmedRound,
-            confirmed: checks[i]?.confirmed ?? false,
-          })),
-        )
+    if (APP_ID === null) {
+      enqueueSnackbar('Missing or invalid VITE_SAHAY_APP_ID in frontend environment', { variant: 'error' })
+      return null
+    }
 
-        const allConfirmed = checks.every((tx) => tx.confirmed)
-        if (allConfirmed) {
-          window.clearInterval(timer)
-          setResult((current) =>
-            current
-              ? {
-                  ...current,
-                  confirmedRound: Math.max(...checks.map((c) => c.confirmedRound)),
-                }
-              : current,
-          )
-          setMerchantStep('active-loan')
-          enqueueSnackbar('Transfer completed', { variant: 'success' })
-        }
-      } catch {
-        // Keep polling; indexer propagation can lag temporarily.
-      }
-    }, 500)
+    const client = new SahayAiLendingClient({
+      algorand,
+      appId: APP_ID,
+      defaultSender: activeAddress,
+    })
+
+    const payload = `${activeAddress}|${notePrefix}|${Date.now()}`
+    const hash = await sha256Hex(payload)
+    const receiver = X402_TREASURY || String(client.appAddress)
+    if (!algosdk.isValidAddress(receiver)) {
+      enqueueSnackbar('Invalid x402 treasury address configured', { variant: 'error' })
+      return null
+    }
+
+    const amountMicro = Number(amountMicroAlgo)
+    if (!Number.isSafeInteger(amountMicro) || amountMicro <= 0) {
+      enqueueSnackbar('Invalid x402 payment amount configured', { variant: 'error' })
+      return null
+    }
+
+    let receiverBalance = 0
+    let receiverMinBalance = ALGORAND_MIN_ACCOUNT_BALANCE
+    try {
+      const receiverAccount = await algorand.client.algod.accountInformation(receiver).do()
+      receiverBalance = Number(receiverAccount.amount ?? 0)
+      receiverMinBalance = Number(receiverAccount.minBalance ?? ALGORAND_MIN_ACCOUNT_BALANCE)
+    } catch {
+      // Receiver account may not exist yet.
+    }
+
+    const receiverDeficit = Math.max(0, receiverMinBalance - receiverBalance)
+    const amountToSend = Math.max(amountMicro, receiverDeficit)
+
+    const senderAccount = await algorand.client.algod.accountInformation(activeAddress).do()
+    const senderBalance = Number(senderAccount.amount ?? 0)
+    const minRequired = amountToSend + 2_000
+    if (senderBalance < minRequired) {
+      enqueueSnackbar('Insufficient ALGO balance for consent payment + fee', { variant: 'error' })
+      return null
+    }
+
+    if (amountToSend > amountMicro) {
+      enqueueSnackbar('Treasury account initialized to Algorand minimum balance (0.1 ALGO)', { variant: 'info' })
+    }
+
+    const payResult = await algorand.send.payment({
+      sender: activeAddress,
+      signer: transactionSigner,
+      receiver,
+      amount: algo(amountToSend / 1_000_000),
+      note: `${notePrefix}:${hash}`,
+    })
+
+    return { hash, txId: payResult.txIds[0] }
   }
 
-  const startAtomicSettlement = async () => {
+  const loadCashflowData = async () => {
+    if (!activeAddress) {
+      enqueueSnackbar('Connect wallet first', { variant: 'warning' })
+      return
+    }
+
+    try {
+      const proof = hasPaidForCashflow ? consentTxId ?? consentHash ?? undefined : undefined
+      const data = await fetchCashflowFromBackend(activeAddress, channels, proof)
+      setCashflowSummary(data.summary)
+      setCashflowEntries(data.entries)
+      setLoanOffer(data.offer)
+      setCashflowId(data.cashflowId)
+      setMerchantStep('offer')
+      enqueueSnackbar('Cashflow data unlocked', { variant: 'success' })
+    } catch (error) {
+      const status = (error as { status?: number })?.status
+      if (status === 402) {
+        setShowPaywall(true)
+        enqueueSnackbar('Access requires micro-payment', { variant: 'info' })
+      } else {
+        enqueueSnackbar('Failed to fetch cashflow data', { variant: 'error' })
+      }
+    }
+  }
+
+  const payAndContinueForCashflow = async () => {
+    setIsPayingForCashflow(true)
+    try {
+      const proof = await sendX402Payment('x402-consent', X402_SETTLEMENT_MICROALGO)
+      if (!proof || !activeAddress) return
+
+      setConsentHash(proof.hash)
+      setConsentTxId(proof.txId)
+      setHasPaidForCashflow(true)
+      setShowPaywall(false)
+
+      const data = await fetchCashflowFromBackend(activeAddress, channels, proof.txId)
+      setCashflowSummary(data.summary)
+      setCashflowEntries(data.entries)
+      setLoanOffer(data.offer)
+      setCashflowId(data.cashflowId)
+      setMerchantStep('offer')
+      enqueueSnackbar('Payment confirmed. Cashflow access granted.', { variant: 'success' })
+    } catch (error) {
+      enqueueSnackbar(`Payment failed: ${toErrorMessage(error)}`, { variant: 'error' })
+    } finally {
+      setIsPayingForCashflow(false)
+    }
+  }
+
+  const submitLoanRequest = async () => {
+    if (!activeAddress || !loanOffer || !cashflowId) {
+      enqueueSnackbar('Unlock your cashflow to create a request', { variant: 'warning' })
+      return
+    }
+
+    setIsSubmittingRequest(true)
+    try {
+      const proof = await sendX402Payment('x402-fee', X402_PLATFORM_FEE_MICROALGO)
+      if (!proof) return
+
+      setPlatformFeeTxId(proof.txId)
+
+      const response = await fetch(`${API_BASE_URL}/api/loans`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          merchantAddress: activeAddress,
+          cashflowId,
+          offerId: loanOffer.id,
+          platformFeeProof: proof.txId,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to submit loan request')
+      }
+
+      const request = (await response.json()) as LoanRequest
+      setLoanRequest(request)
+      setMerchantStep('requested')
+      enqueueSnackbar('Loan request submitted to the lending pool', { variant: 'success' })
+    } catch (error) {
+      enqueueSnackbar(`Request failed: ${toErrorMessage(error)}`, { variant: 'error' })
+    } finally {
+      setIsSubmittingRequest(false)
+    }
+  }
+
+  const refreshLoanRequests = async () => {
+    setIsLoadingLoans(true)
+    try {
+      const data = await fetchLoanRequests()
+      setLoanRequests(data)
+    } catch (error) {
+      enqueueSnackbar(`Unable to load loan requests: ${toErrorMessage(error)}`, { variant: 'error' })
+    } finally {
+      setIsLoadingLoans(false)
+    }
+  }
+
+  const refreshLoanRequest = async () => {
+    if (!loanRequest) return
+    try {
+      const updated = await fetchLoanRequestById(loanRequest.id)
+      setLoanRequest(updated)
+      if (updated.status === 'funded') {
+        setMerchantStep('active-loan')
+      }
+    } catch {
+      // Keep status as-is.
+    }
+  }
+
+  const fundLoanRequest = async (request: LoanRequest) => {
     if (APP_ID === null) {
       enqueueSnackbar('Missing or invalid VITE_SAHAY_APP_ID in frontend environment', { variant: 'error' })
       return
     }
 
     if (!activeAddress || !transactionSigner) {
-      enqueueSnackbar('Connect wallet before accepting the offer', { variant: 'warning' })
+      enqueueSnackbar('Connect a lender wallet to fund', { variant: 'warning' })
       return
     }
 
-    setIsSubmitting(true)
-    setMerchantStep('settling')
-    setProgress(initialProgress())
+    setIsFundingLoan(true)
+    setFundingLoanId(request.id)
 
     try {
       const client = new SahayAiLendingClient({
@@ -214,10 +404,17 @@ export default function Home() {
         defaultSender: activeAddress,
       })
 
-      const [lenderAuthState, usdcAssetIdState] = await Promise.all([
+      const [lenderAuthState, usdcAssetIdState, lockedFxRate] = await Promise.all([
         client.state.global.lenderAuth(),
         client.state.global.usdcAssetId(),
+        client.state.global.lockedInrPerUsdPaise(),
       ])
+
+      if (!lockedFxRate || lockedFxRate === 0n) {
+        enqueueSnackbar('Contract FX rate is not configured yet', { variant: 'error' })
+        return
+      }
+
       const lenderAuthBytes = lenderAuthState.asByteArray()
       if (lenderAuthBytes && lenderAuthBytes.length === 32 && !isZeroAddressBytes(lenderAuthBytes)) {
         const lenderAddress = algosdk.encodeAddress(lenderAuthBytes)
@@ -226,53 +423,21 @@ export default function Home() {
           return
         }
       }
+
       const fundingAssetId = usdcAssetIdState && usdcAssetIdState > 0n ? usdcAssetIdState : ASSET_ID
+      const loanAmountInr = BigInt(Math.round(request.offer.loanAmountInr))
+      const repaymentAmountInr = BigInt(Math.round(request.offer.repaymentAmountInr))
+      const repaymentPercentage = BigInt(Math.round(request.offer.repaymentPercentage))
+      const fundingMicroUsdc = (loanAmountInr * 100n * 1_000_000n) / lockedFxRate
 
-      const lockedFxRate = await client.state.global.lockedInrPerUsdPaise()
-      if (!lockedFxRate || lockedFxRate === 0n) {
-        if (LOCKED_INR_PER_USD_PAISE <= 0n) {
-          enqueueSnackbar('Missing VITE_SAHAY_LOCKED_INR_PER_USD_PAISE value', { variant: 'error' })
-          return
-        }
-
-        await client.send.setFxRate({
-          sender: activeAddress,
-          signer: transactionSigner,
-          args: {
-            lockedInrPerUsdPaise: LOCKED_INR_PER_USD_PAISE,
-          },
-        })
-        enqueueSnackbar(`Initialized contract FX rate to ${LOCKED_INR_PER_USD_PAISE.toString()} paise per USD`, {
-          variant: 'info',
-        })
-      }
-
-      const [borrowerAuthState, totalUsdcOwedMicroState, totalUsdcRepaidMicroState, loanClosedState] = await Promise.all([
-        client.state.global.borrowerAuth(),
-        client.state.global.totalUsdcOwedMicro(),
-        client.state.global.totalUsdcRepaidMicro(),
-        client.state.global.loanClosed(),
-      ])
-      const activeLoanOpen = (loanClosedState ?? 0n) === 0n && (totalUsdcOwedMicroState ?? 0n) > (totalUsdcRepaidMicroState ?? 0n)
-      if (activeLoanOpen) {
-        const borrowerBytes = borrowerAuthState.asByteArray()
-        const borrowerAddress = borrowerBytes && borrowerBytes.length === 32 && !isZeroAddressBytes(borrowerBytes)
-          ? algosdk.encodeAddress(borrowerBytes)
-          : null
-        if (!borrowerAddress || borrowerAddress === activeAddress) {
-          setMerchantStep('active-loan')
-          enqueueSnackbar('An active loan already exists. Open the live loan view instead of creating a new one.', {
-            variant: 'info',
-          })
-          return
-        }
-        enqueueSnackbar('This app already has an active loan on-chain', { variant: 'error' })
+      if (fundingMicroUsdc <= 0n) {
+        enqueueSnackbar('Computed USDC amount is zero; verify FX rate', { variant: 'error' })
         return
       }
 
       const senderAccount = await algorand.client.algod.accountInformation(activeAddress).do()
       const senderAssetHolding = senderAccount.assets?.find((asset) => asset.assetId === fundingAssetId)
-      if (!senderAssetHolding || Number(senderAssetHolding.amount ?? 0) < Number(LOAN_AMOUNT)) {
+      if (!senderAssetHolding || Number(senderAssetHolding.amount ?? 0) < Number(fundingMicroUsdc)) {
         enqueueSnackbar(
           `Connected wallet does not hold enough of asset ${fundingAssetId.toString()} to fund the loan`,
           { variant: 'error' },
@@ -284,69 +449,60 @@ export default function Home() {
         sender: activeAddress,
         signer: transactionSigner,
         args: {
-          borrower: activeAddress,
-          loanAmount: LOAN_AMOUNT,
-          repaymentAmount: REPAYMENT_AMOUNT,
-          repaymentPercentage: REPAYMENT_PERCENTAGE,
+          borrower: request.merchantAddress,
+          loanAmount: loanAmountInr,
+          repaymentAmount: repaymentAmountInr,
+          repaymentPercentage,
         },
       })
 
-      const composer = algorand
+      const sendResult = await algorand
         .newGroup()
         .addAssetTransfer({
           sender: activeAddress,
           signer: transactionSigner,
           assetId: fundingAssetId,
-          receiver: activeAddress,
-          amount: LOAN_AMOUNT,
+          receiver: request.merchantAddress,
+          amount: fundingMicroUsdc,
         })
         .addAppCallMethodCall(appCall)
+        .send({ maxRoundsToWaitForConfirmation: 4 })
 
-      const sendResult = await composer.send({ maxRoundsToWaitForConfirmation: 4 })
-      const txIds = sendResult.txIds
-      setProgress((current) =>
-        current.map((item, i) => ({
-          ...item,
-          txId: txIds[i],
-        })),
-      )
-
-      setResult({
-        groupId: sendResult.groupId,
-        appId: APP_ID,
-        appAddress: String(client.appAddress),
-        assetId: fundingAssetId,
-        network: algodConfig.network,
-        borrower: activeAddress,
-        loanAmount: LOAN_AMOUNT,
-        repaymentAmount: REPAYMENT_AMOUNT,
-        repaymentPercentage: REPAYMENT_PERCENTAGE,
-        txIds,
-        confirmedRound: 0,
+      await fetch(`${API_BASE_URL}/api/loans/${request.id}/settled`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lenderAddress: activeAddress,
+          groupId: sendResult.groupId,
+          txIds: sendResult.txIds,
+        }),
       })
 
-      enqueueSnackbar('Transfer submitted. Finalizing...', { variant: 'info' })
-      pollForConfirmation(txIds)
+      enqueueSnackbar('Loan funded on-chain and recorded', { variant: 'success' })
+      await refreshLoanRequests()
     } catch (error) {
-      enqueueSnackbar(`Transfer failed: ${toErrorMessage(error)}`, { variant: 'error' })
-      setMerchantStep('approved')
+      enqueueSnackbar(`Funding failed: ${toErrorMessage(error)}`, { variant: 'error' })
     } finally {
-      setIsSubmitting(false)
+      setIsFundingLoan(false)
+      setFundingLoanId(null)
     }
   }
 
   const resetDemo = () => {
     setMerchantStep('connect')
     setChannels({ upi: false, bank: false, pos: false })
-    setCashflowData(null)
+    setCashflowSummary(null)
+    setCashflowEntries([])
+    setLoanOffer(null)
+    setCashflowId(null)
+    setLoanRequest(null)
     setHasPaidForCashflow(false)
     setShowPaywall(false)
     setShowAccessDetails(false)
     setConsentHash(null)
     setConsentTxId(null)
+    setPlatformFeeTxId(null)
     setRepaymentTxId(null)
-    setResult(null)
-    setProgress(initialProgress())
   }
 
   const submitRepayment = async () => {
@@ -407,7 +563,7 @@ export default function Home() {
       }
 
       const repaymentAssetId = usdcAssetIdState && usdcAssetIdState > 0n ? usdcAssetIdState : ASSET_ID
-      const repaymentPercentage = repaymentPercentageState && repaymentPercentageState > 0n ? repaymentPercentageState : REPAYMENT_PERCENTAGE
+      const repaymentPercentage = repaymentPercentageState && repaymentPercentageState > 0n ? repaymentPercentageState : BigInt(repaymentPercentageLabel)
       const remainingOwedMicroUsdc = (totalUsdcOwedMicroState ?? 0n) > (totalUsdcRepaidMicroState ?? 0n)
         ? (totalUsdcOwedMicroState ?? 0n) - (totalUsdcRepaidMicroState ?? 0n)
         : 0n
@@ -467,108 +623,6 @@ export default function Home() {
     setChannels((current) => ({ ...current, [channel]: !current[channel] }))
   }
 
-  const loadCashflowData = async () => {
-    if (!activeAddress) {
-      enqueueSnackbar('Connect wallet first', { variant: 'warning' })
-      return
-    }
-
-    try {
-      const data = await fetchCashflowFromBackend(activeAddress, hasPaidForCashflow)
-      setCashflowData(data)
-      enqueueSnackbar('Cashflow data unlocked', { variant: 'success' })
-    } catch (error) {
-      const status = (error as { status?: number })?.status
-      if (status === 402) {
-        setShowPaywall(true)
-        enqueueSnackbar('Access requires micro-payment', { variant: 'info' })
-      } else {
-        enqueueSnackbar('Failed to fetch cashflow data', { variant: 'error' })
-      }
-    }
-  }
-
-  const payAndContinueForCashflow = async () => {
-    if (!activeAddress || !transactionSigner) {
-      enqueueSnackbar('Connect wallet before payment', { variant: 'warning' })
-      return
-    }
-
-    if (APP_ID === null) {
-      enqueueSnackbar('Missing or invalid VITE_SAHAY_APP_ID in frontend environment', { variant: 'error' })
-      return
-    }
-
-    setIsPayingForCashflow(true)
-    try {
-      const client = new SahayAiLendingClient({
-        algorand,
-        appId: APP_ID,
-        defaultSender: activeAddress,
-      })
-
-      const consentPayload = `${activeAddress}|cashflow-read|${Date.now()}`
-      const hash = await sha256Hex(consentPayload)
-      const receiver = X402_TREASURY || String(client.appAddress)
-      if (!algosdk.isValidAddress(receiver)) {
-        enqueueSnackbar('Invalid x402 treasury address configured', { variant: 'error' })
-        return
-      }
-
-      const amountMicroAlgo = Number(X402_SETTLEMENT_MICROALGO)
-      if (!Number.isSafeInteger(amountMicroAlgo) || amountMicroAlgo <= 0) {
-        enqueueSnackbar('Invalid VITE_X402_SETTLEMENT_MICROALGO value', { variant: 'error' })
-        return
-      }
-
-      let receiverBalance = 0
-      let receiverMinBalance = ALGORAND_MIN_ACCOUNT_BALANCE
-      try {
-        const receiverAccount = await algorand.client.algod.accountInformation(receiver).do()
-        receiverBalance = Number(receiverAccount.amount ?? 0)
-        receiverMinBalance = Number(receiverAccount.minBalance ?? ALGORAND_MIN_ACCOUNT_BALANCE)
-      } catch {
-        // If account doesn't exist yet, funding at least min balance is required to create it.
-      }
-
-      const receiverDeficit = Math.max(0, receiverMinBalance - receiverBalance)
-      const amountToSend = Math.max(amountMicroAlgo, receiverDeficit)
-
-      const senderAccount = await algorand.client.algod.accountInformation(activeAddress).do()
-      const senderBalance = Number(senderAccount.amount ?? 0)
-      const minRequired = amountToSend + 2_000
-      if (senderBalance < minRequired) {
-        enqueueSnackbar('Insufficient ALGO balance for consent payment + fee', { variant: 'error' })
-        return
-      }
-
-      if (amountToSend > amountMicroAlgo) {
-        enqueueSnackbar('Treasury account is being initialized to Algorand minimum balance (0.1 ALGO)', { variant: 'info' })
-      }
-
-      const payResult = await algorand.send.payment({
-        sender: activeAddress,
-        signer: transactionSigner,
-        receiver,
-        amount: algo(amountToSend / 1_000_000),
-        note: `x402-consent:${hash}`,
-      })
-
-      setConsentHash(hash)
-      setConsentTxId(payResult.txIds[0])
-      setHasPaidForCashflow(true)
-      setShowPaywall(false)
-
-      const data = await fetchCashflowFromBackend(activeAddress, true)
-      setCashflowData(data)
-      enqueueSnackbar('Payment confirmed. Cashflow access granted.', { variant: 'success' })
-    } catch (error) {
-      enqueueSnackbar(`Payment failed: ${toErrorMessage(error)}`, { variant: 'error' })
-    } finally {
-      setIsPayingForCashflow(false)
-    }
-  }
-
   const renderWalletSelector = () => (
     <div className="wallet-area">
       {!activeAddress && (
@@ -588,7 +642,7 @@ export default function Home() {
       {activeAddress && (
         <div className="active-wallet">
           <span className="label">Connected wallet</span>
-          <strong>{activeAddress}</strong>
+          <strong>{ellipseAddress(activeAddress, 7)}</strong>
           {activeWallet && (
             <button className="ghost" onClick={() => activeWallet.disconnect()}>
               Disconnect
@@ -598,6 +652,19 @@ export default function Home() {
       )}
     </div>
   )
+
+  useEffect(() => {
+    if (surface !== 'lender') return
+    void refreshLoanRequests()
+  }, [surface])
+
+  useEffect(() => {
+    if (!loanRequest || merchantStep !== 'requested') return
+    const timer = window.setInterval(() => {
+      void refreshLoanRequest()
+    }, 4000)
+    return () => window.clearInterval(timer)
+  }, [loanRequest, merchantStep])
 
   return (
     <main className="hub-root">
@@ -616,8 +683,8 @@ export default function Home() {
           <div className="hub-grid">
             <article className="hub-card">
               <div className="hub-icon">Store</div>
-              <h2>Merchant App</h2>
-              <p>See how a small business unlocks fast working-capital credit with consent-led data access.</p>
+              <h2>Merchant PWA</h2>
+              <p>Unlock consent-led cashflow collateral, then submit a verified loan request.</p>
               <button className="hub-cta" onClick={() => setSurface('merchant')}>
                 View Mobile App
               </button>
@@ -626,7 +693,7 @@ export default function Home() {
             <article className="hub-card">
               <div className="hub-icon">Fund</div>
               <h2>Lender Dashboard</h2>
-              <p>Monitor pool health, anonymized borrower performance, and repayment behavior.</p>
+              <p>Review AI-scored MSME requests, fund in USDC, and watch repayments settle.</p>
               <button className="hub-cta secondary" onClick={() => setSurface('lender')}>
                 View Dashboard
               </button>
@@ -638,10 +705,10 @@ export default function Home() {
       {surface === 'merchant' && (
         <section className="merchant-wrap">
           <aside className="merchant-side">
-            <p className="chip">Merchant App</p>
+            <p className="chip">Merchant PWA</p>
             <p className="micro-copy">Loan offer: {loanAmountLabel}</p>
             <p className="micro-copy">Expected repayment: {repaymentAmountLabel}</p>
-            <p className="micro-copy">Auto-repayment: {REPAYMENT_PERCENTAGE.toString()}% of verified inflow</p>
+            <p className="micro-copy">Auto-repayment: {repaymentPercentageLabel}% of verified inflow</p>
             {renderWalletSelector()}
           </aside>
 
@@ -655,8 +722,8 @@ export default function Home() {
             {merchantStep === 'connect' && (
               <div className="phone-body">
                 <div className="badge-icon">Shield</div>
-                <h3>Calculate Your Loan Limit</h3>
-                <p>Select your primary sales channels to verify daily cashflow.</p>
+                <h3>Verify Cashflow Collateral</h3>
+                <p>Select revenue channels and unlock the cashflow feed with an x402 consent payment.</p>
 
                 <div className="x402-banner">
                   <p>Collateral data access</p>
@@ -690,24 +757,16 @@ export default function Home() {
                   <span className="radio">{channels.pos ? 'ON' : ''}</span>
                 </button>
 
-                <button
-                  className={`phone-cta ${hasSelectedChannel ? 'analysis-ready' : 'muted'}`}
-                  disabled={!canAnalyze}
-                  onClick={() => setMerchantStep('approved')}
-                >
-                  Analyze Cash Flow
-                </button>
-
-                {cashflowData && (
+                {cashflowSummary && (
                   <div className="cashflow-card">
                     <small>Verified Collateral Snapshot</small>
-                    <p>Avg Daily Revenue: Rs{cashflowData.avgDailyRevenueInr.toLocaleString()}</p>
-                    <p>Monthly Inflow: Rs{cashflowData.monthlyInflowInr.toLocaleString()}</p>
-                    <p>Health: {cashflowData.cashflowHealth}</p>
+                    <p>Avg Daily Revenue: ₹{cashflowSummary.avgDailyRevenueInr.toLocaleString()}</p>
+                    <p>Monthly Inflow: ₹{cashflowSummary.monthlyInflowInr.toLocaleString()}</p>
+                    <p>Health: {cashflowSummary.cashflowHealth}</p>
                   </div>
                 )}
 
-                {showAccessDetails && consentHash && consentTxId && (
+                {consentHash && consentTxId && (
                   <div className="consent-proof">
                     <small>Technical consent receipt</small>
                     <p>{consentHash.slice(0, 22)}...</p>
@@ -719,39 +778,85 @@ export default function Home() {
               </div>
             )}
 
-            {merchantStep === 'approved' && (
+            {merchantStep === 'offer' && loanOffer && cashflowSummary && (
               <div className="phone-body success-tone">
-                <div className="badge-icon success">OK</div>
-                <p className="status-pill">Credit Generated</p>
-                <h3 className="amount">₹20,000</h3>
-                <h4>Approved</h4>
+                <div className="badge-icon success">AI</div>
+                <p className="status-pill">Credit Window</p>
+                <h3 className="amount">{loanAmountLabel}</h3>
+                <h4>Offer Ready</h4>
 
-                <div className="info-card">
-                  <p>Repayment auto-set to {REPAYMENT_PERCENTAGE.toString()}% of linked flow.</p>
+                <div className="offer-card">
+                  <div>
+                    <span>Tenure</span>
+                    <strong>{loanOffer.tenureMonths} months</strong>
+                  </div>
+                  <div>
+                    <span>APR</span>
+                    <strong>{loanOffer.interestRateApr}%</strong>
+                  </div>
+                  <div>
+                    <span>Risk tier</span>
+                    <strong>{loanOffer.riskTier}</strong>
+                  </div>
+                  <div>
+                    <span>Platform fee</span>
+                    <strong>₹{loanOffer.platformFeeInr.toLocaleString()}</strong>
+                  </div>
                 </div>
 
-                <button className="phone-cta" disabled={!activeAddress || APP_ID === null || isSubmitting} onClick={startAtomicSettlement}>
-                  {isSubmitting ? 'Submitting...' : 'Accept & Transfer to Bank'}
-                </button>
-              </div>
-            )}
-
-            {merchantStep === 'settling' && (
-              <div className="phone-body">
-                <div className="badge-icon">Sync</div>
-                <h3>Processing Transfer</h3>
-                <p>Please wait while we securely complete your transfer.</p>
-                <div className="timeline compact">
-                  {progress.map((item) => (
-                    <div key={item.label} className={`timeline-item ${item.confirmed ? 'done' : ''}`}>
-                      <div className="dot" />
+                <div className="cashflow-feed">
+                  <div className="feed-head">
+                    <span>Recent inflows</span>
+                    <span>{cashflowEntries.length} entries</span>
+                  </div>
+                  {cashflowEntries.slice(0, 12).map((entry) => (
+                    <div key={entry.id} className="cashflow-entry">
                       <div>
-                        <p>{item.label}</p>
-                        <small>{item.confirmedRound ? `Round ${item.confirmedRound}` : item.txId ? item.txId.slice(0, 14) : 'Pending...'}</small>
+                        <strong>₹{entry.amountInr.toLocaleString()}</strong>
+                        <span>{entry.channel}</span>
+                      </div>
+                      <div>
+                        <span>{entry.date}</span>
+                        <small>{entry.ref}</small>
                       </div>
                     </div>
                   ))}
                 </div>
+
+                <button className="phone-cta" disabled={isSubmittingRequest} onClick={submitLoanRequest}>
+                  {isSubmittingRequest ? 'Submitting...' : 'Pay Platform Fee & Submit'}
+                </button>
+              </div>
+            )}
+
+            {merchantStep === 'requested' && (
+              <div className="phone-body">
+                <div className="badge-icon">Sync</div>
+                <h3>Request Submitted</h3>
+                <p>We are matching your request with an on-chain lender.</p>
+
+                <div className="request-card">
+                  <div>
+                    <span>Status</span>
+                    <strong>{loanRequest?.status ?? 'pending'}</strong>
+                  </div>
+                  <div>
+                    <span>Request ID</span>
+                    <strong>{loanRequest ? loanRequest.id.slice(0, 8) : '---'}</strong>
+                  </div>
+                  <div>
+                    <span>Platform fee</span>
+                    <strong>{platformFeeTxId ? 'Paid' : 'Pending'}</strong>
+                  </div>
+                </div>
+
+                <button className="phone-cta" onClick={refreshLoanRequest}>
+                  Check Funding Status
+                </button>
+
+                <button className="phone-cta muted" onClick={resetDemo}>
+                  Run Demo Again
+                </button>
               </div>
             )}
 
@@ -764,7 +869,7 @@ export default function Home() {
 
                 <div className="loan-card">
                   <p>Remaining Balance</p>
-                  <h3>₹19,480</h3>
+                  <h3>{repaymentAmountLabel}</h3>
                   <div className="progress-bar">
                     <div className="progress-fill" />
                   </div>
@@ -789,24 +894,12 @@ export default function Home() {
                   {isRepaying ? 'Processing Repayment...' : `Run Repayment Step (₹${REPAYMENT_STEP_INR.toString()})`}
                 </button>
 
-                {result && (
+                {repaymentTxId && (
                   <div className="proof-links">
                     <small>Auto-pay and consent trail active</small>
-                    {showAccessDetails && (
-                      <>
-                        <small>Ref: {result.groupId.slice(0, 18)}...</small>
-                        {result.txIds.map((txId) => (
-                          <a key={txId} target="_blank" rel="noreferrer" href={`${networkExplorerBase(result.network)}/transaction/${txId}`}>
-                            View {txId.slice(0, 8)}...
-                          </a>
-                        ))}
-                      </>
-                    )}
-                    {repaymentTxId && (
-                      <a target="_blank" rel="noreferrer" href={`${networkExplorerBase(algodConfig.network)}/transaction/${repaymentTxId}`}>
-                        View latest repayment txn
-                      </a>
-                    )}
+                    <a target="_blank" rel="noreferrer" href={`${networkExplorerBase(algodConfig.network)}/transaction/${repaymentTxId}`}>
+                      View latest repayment txn
+                    </a>
                   </div>
                 )}
 
@@ -829,41 +922,77 @@ export default function Home() {
           <div className="lender-grid">
             <article>
               <p>Active MSME Loans</p>
-              <strong>184</strong>
+              <strong>{loanRequests.filter((item) => item.status === 'funded').length}</strong>
             </article>
             <article>
-              <p>Liquidity Deployed</p>
-              <strong>₹52.4L</strong>
+              <p>Pending Requests</p>
+              <strong>{loanRequests.filter((item) => item.status === 'pending').length}</strong>
             </article>
             <article>
-              <p>Repayment Efficiency</p>
-              <strong>96.2%</strong>
+              <p>Avg Risk Tier</p>
+              <strong>{loanRequests.length ? loanRequests[0].offer.riskTier : 'B'}</strong>
             </article>
             <article>
-              <p>Avg Yield (APR)</p>
-              <strong>13.8%</strong>
+              <p>Avg APR</p>
+              <strong>
+                {loanRequests.length
+                  ? `${Math.round(loanRequests.reduce((sum, item) => sum + item.offer.interestRateApr, 0) / loanRequests.length)}%`
+                  : '13%'}
+              </strong>
             </article>
           </div>
 
+          <div className="lender-actions">
+            {renderWalletSelector()}
+            <button className="hub-cta secondary" onClick={refreshLoanRequests}>
+              {isLoadingLoans ? 'Refreshing...' : 'Refresh Requests'}
+            </button>
+          </div>
+
           <div className="portfolio-card">
-            <h3>Recent Settlement Groups</h3>
+            <h3>Loan Requests</h3>
             <p className="micro-copy">
-              x402-inspired model: collateral data is released after micro-payment consent, with auditable consent hashes.
+              Each request is generated from x402-consented cashflow. Fund with USDC to settle on-chain.
             </p>
-            <ul>
-              <li>
-                <span>MSME-A17</span>
-                <span>Disbursal completed</span>
-              </li>
-              <li>
-                <span>MSME-D03</span>
-                <span>Repayment auto-deducting</span>
-              </li>
-              <li>
-                <span>MSME-B24</span>
-                <span>Yield stream healthy</span>
-              </li>
-            </ul>
+            <div className="loan-request-grid">
+              {loanRequests.map((request) => (
+                <div key={request.id} className="loan-request-card">
+                  <div className="loan-request-head">
+                    <div>
+                      <strong>{ellipseAddress(request.merchantAddress, 6)}</strong>
+                      <span>Cashflow health: {request.summary.cashflowHealth}</span>
+                    </div>
+                    <span className={`status-chip status-${request.status}`}>{request.status}</span>
+                  </div>
+                  <div className="loan-request-body">
+                    <div>
+                      <p>Loan</p>
+                      <strong>₹{request.offer.loanAmountInr.toLocaleString()}</strong>
+                    </div>
+                    <div>
+                      <p>Tenure</p>
+                      <strong>{request.offer.tenureMonths} mo</strong>
+                    </div>
+                    <div>
+                      <p>APR</p>
+                      <strong>{request.offer.interestRateApr}%</strong>
+                    </div>
+                    <div>
+                      <p>Risk</p>
+                      <strong>{request.offer.riskTier}</strong>
+                    </div>
+                  </div>
+                  <button
+                    className="hub-cta"
+                    disabled={isFundingLoan && fundingLoanId === request.id}
+                    onClick={() => fundLoanRequest(request)}
+                  >
+                    {isFundingLoan && fundingLoanId === request.id ? 'Funding...' : 'Fund on Algorand'}
+                  </button>
+                </div>
+              ))}
+              {!loanRequests.length && <p className="micro-copy">No loan requests yet. Submit one from the merchant view.</p>}
+            </div>
           </div>
         </section>
       )}

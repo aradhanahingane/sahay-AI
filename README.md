@@ -13,6 +13,7 @@ This starter full stack project has been generated using AlgoKit. See below for 
 6. For project-specific instructions, refer to the READMEs of the child projects:
    - Smart Contracts: [sahayAI-contracts](projects/sahayAI-contracts/README.md)
    - Frontend Application: [sahayAI-frontend](projects/sahayAI-frontend/README.md)
+   - Backend API: [sahayAI-server](projects/sahayAI-server/README.md)
 
 > This project is structured as a monorepo, refer to the [documentation](https://github.com/algorandfoundation/algokit-cli/blob/main/docs/features/project/run.md) to learn more about custom command orchestration via `algokit project run`.
 
